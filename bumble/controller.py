@@ -298,6 +298,7 @@ class Controller:
     event_mask_page_2: int = 0
     supported_commands: set[int] = {
         hci.HCI_DISCONNECT_COMMAND,
+        hci.HCI_WRITE_PAGE_TIMEOUT_COMMAND,
         hci.HCI_READ_REMOTE_VERSION_INFORMATION_COMMAND,
         hci.HCI_READ_CLOCK_OFFSET_COMMAND,
         hci.HCI_READ_LMP_HANDLE_COMMAND,
@@ -411,6 +412,7 @@ class Controller:
     advertising_data: bytes | None = None
     advertising_timer_handle: asyncio.Handle | None = None
     classic_scan_enable: int = 0
+    page_timeout: int = 0x2000
     classic_allow_role_switch: bool = True
     pending_le_connection: (
         hci.HCI_LE_Create_Connection_Command
@@ -3213,6 +3215,15 @@ class Controller:
         See Bluetooth spec Vol 4, Part E - 7.8.17 LE Remove Device From Filter Accept
         List Command
         '''
+        return hci.HCI_StatusReturnParameters(hci.HCI_ErrorCode.SUCCESS)
+
+    def on_hci_write_page_timeout_command(
+        self, command: hci.HCI_Write_Page_Timeout_Command
+    ) -> hci.HCI_StatusReturnParameters:
+        '''
+        See Bluetooth spec Vol 4, Part E - 7.3.16 Write Page Timeout Command
+        '''
+        self.page_timeout = command.page_timeout
         return hci.HCI_StatusReturnParameters(hci.HCI_ErrorCode.SUCCESS)
 
     def on_hci_write_scan_enable_command(

@@ -24,7 +24,7 @@ from unittest import mock
 
 import pytest
 
-from bumble import gatt, hci, smp, utils
+from bumble import core, gatt, hci, smp, utils
 from bumble.core import (
     AdvertisingData,
     InvalidStateError,
@@ -942,6 +942,162 @@ async def test_accept_classic_connection(roles: tuple[hci.Role, hci.Role]):
     assert devices.connections[0].role == roles[0]
     assert devices.connections[1]
     assert devices.connections[1].role == roles[1]
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'timeout, slots', [(1.234, 1974), (100.0, 0xFFFF), (0.000001, 1)]
+)
+async def test_classic_page_timeout(timeout: float, slots: int) -> None:
+    devices = TwoDevices()
+    await devices[0].power_on()
+    await devices[0]._set_classic_page_timeout(timeout)
+    assert devices.controllers[0].page_timeout == slots
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_classic_page_timeout_configuration() -> None:
+    devices = TwoDevices()
+    assert DeviceConfiguration().classic_page_timeout == 5.12
+    config = DeviceConfiguration()
+    config.classic_page_timeout = 2.56
+    config.classic_enabled = True
+    device = Device(config=config, host=devices[0].host)
+    assert device.classic_page_timeout == 2.56
+    await device.power_on()
+    assert devices.controllers[0].page_timeout == 4096
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_classic_page_timeout_connect() -> None:
+    devices = TwoDevices()
+    devices[0].classic_page_timeout = 1.28
+    for device in devices.devices:
+        device.classic_enabled = True
+        await device.power_on()
+    controller = devices.controllers[0]
+    with mock.patch.object(
+        controller,
+        'on_hci_write_page_timeout_command',
+        wraps=controller.on_hci_write_page_timeout_command,
+    ) as write:
+        await devices[0].connect_classic(devices[1].public_address, timeout=1.234)
+    assert [call.args[0].page_timeout for call in write.call_args_list] == [
+        1974,
+        2048,
+    ]
+    assert controller.page_timeout == 2048
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'timeout, status',
+    [
+        (None, hci.HCI_ErrorCode.PAGE_TIMEOUT_ERROR),
+        (10.0, hci.HCI_ErrorCode.PAGE_TIMEOUT_ERROR),
+        (None, hci.HCI_ErrorCode.CONNECTION_REJECTED_DUE_TO_SECURITY_REASONS_ERROR),
+    ],
+)
+async def test_classic_page_timeout_retry(
+    timeout: float | None, status: hci.HCI_ErrorCode
+) -> None:
+    devices = TwoDevices()
+    for device in devices.devices:
+        device.classic_enabled = True
+        await device.power_on()
+    controller = devices.controllers[0]
+    original = controller.on_hci_create_connection_command
+    attempts = 0
+
+    def create_connection(command: hci.HCI_Create_Connection_Command) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts > 1:
+            original(command)
+            return
+        controller._send_hci_command_status(
+            hci.HCI_COMMAND_STATUS_PENDING, command.op_code
+        )
+        asyncio.get_running_loop().call_soon(
+            controller.on_classic_connection_complete, command.bd_addr, status
+        )
+
+    with mock.patch.object(
+        controller, 'on_hci_create_connection_command', create_connection
+    ):
+        if timeout is None and status == hci.HCI_ErrorCode.PAGE_TIMEOUT_ERROR:
+            connection = await asyncio.wait_for(
+                devices[0].connect_classic(devices[1].public_address, timeout=timeout),
+                1.0,
+            )
+            assert connection.peer_address == devices[1].public_address
+            assert attempts == 2
+        else:
+            with pytest.raises(core.ConnectionError) as error:
+                await devices[0].connect_classic(
+                    devices[1].public_address, timeout=timeout
+                )
+            assert error.value.error_code == status
+            assert attempts == 1
+    assert controller.page_timeout == 0x2000
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_classic_page_timeout_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    devices = TwoDevices()
+    controller = devices.controllers[0]
+    monkeypatch.setattr(
+        controller,
+        'supported_commands',
+        controller.supported_commands - {hci.HCI_WRITE_PAGE_TIMEOUT_COMMAND},
+    )
+    with mock.patch.object(controller, 'on_hci_write_page_timeout_command') as write:
+        for device in devices.devices:
+            device.classic_enabled = True
+            await device.power_on()
+        await devices[0].connect_classic(devices[1].public_address, timeout=1.0)
+    write.assert_not_called()
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.parametrize('timeout, flush', [(None, False), (None, True), (10.0, False)])
+async def test_classic_page_timeout_cancel(timeout: float | None, flush: bool) -> None:
+    devices = TwoDevices()
+    devices[0].classic_enabled = True
+    await devices[0].power_on()
+    controller = devices.controllers[0]
+    paging = asyncio.Event()
+
+    def create_connection(command: hci.HCI_Create_Connection_Command) -> None:
+        controller._send_hci_command_status(
+            hci.HCI_COMMAND_STATUS_PENDING, command.op_code
+        )
+        paging.set()
+
+    with mock.patch.object(
+        controller, 'on_hci_create_connection_command', create_connection
+    ):
+        task = asyncio.create_task(
+            devices[0].connect_classic(devices[1].public_address, timeout=timeout)
+        )
+        await asyncio.wait_for(paging.wait(), 1.0)
+        await async_barrier()
+        if flush:
+            await devices[0].host.flush()
+        else:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1.0)
+    assert controller.page_timeout == 0x2000
+    assert not devices[0].pending_connections
 
 
 # -----------------------------------------------------------------------------

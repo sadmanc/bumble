@@ -2237,6 +2237,7 @@ class DeviceConfiguration:
     le_subrate_enabled: bool = False
     le_shorter_connection_intervals_enabled: bool = False
     classic_enabled: bool = False
+    classic_page_timeout: float = 5.12
     classic_sc_enabled: bool = True
     classic_ssp_enabled: bool = True
     classic_smp_enabled: bool = True
@@ -2593,6 +2594,7 @@ class Device(utils.CompositeEventEmitter):
             config.le_shorter_connection_intervals_enabled
         )
         self.classic_enabled = config.classic_enabled
+        self.classic_page_timeout = config.classic_page_timeout
         self.cis_enabled = config.cis_enabled
         self.classic_sc_enabled = config.classic_sc_enabled
         self.classic_ssp_enabled = config.classic_ssp_enabled
@@ -3094,6 +3096,8 @@ class Device(utils.CompositeEventEmitter):
             await self.send_sync_command_raw(
                 hci.HCI_Write_Local_Name_Command(local_name=self.name.encode('utf8'))
             )
+            if self.host.supports_command(hci.HCI_WRITE_PAGE_TIMEOUT_COMMAND):
+                await self._set_classic_page_timeout(self.classic_page_timeout)
             await self.send_sync_command_raw(
                 hci.HCI_Write_Class_Of_Device_Command(
                     class_of_device=self.class_of_device
@@ -4059,6 +4063,13 @@ class Device(utils.CompositeEventEmitter):
             self.le_connecting = False
             self.connect_own_address_type = None
 
+    async def _set_classic_page_timeout(self, timeout: float) -> None:
+        await self.send_sync_command(
+            hci.HCI_Write_Page_Timeout_Command(
+                page_timeout=max(1, min(0xFFFF, round(timeout / 0.000625)))
+            )
+        )
+
     async def connect_classic(
         self,
         peer_address: hci.Address | str,
@@ -4104,7 +4115,14 @@ class Device(utils.CompositeEventEmitter):
         self.on(self.EVENT_CONNECTION, on_connection)
         self.on(self.EVENT_CONNECTION_FAILURE, on_connection_failure)
 
+        set_page_timeout = timeout is not None and self.host.supports_command(
+            hci.HCI_WRITE_PAGE_TIMEOUT_COMMAND
+        )
         try:
+            if set_page_timeout:
+                assert timeout is not None
+                await self._set_classic_page_timeout(timeout)
+
             # Save pending connection
             self.pending_connections[peer_address] = Connection(
                 device=self,
@@ -4118,23 +4136,33 @@ class Device(utils.CompositeEventEmitter):
                 parameters=Connection.Parameters(0, 0, 0),
             )
 
-            # TODO: allow passing other settings
-            await self.send_async_command(
-                hci.HCI_Create_Connection_Command(
-                    bd_addr=peer_address,
-                    packet_type=0xCC18,  # FIXME: change
-                    page_scan_repetition_mode=hci.HCI_R2_PAGE_SCAN_REPETITION_MODE,
-                    clock_offset=0x0000,
-                    allow_role_switch=0x01,
-                    reserved=0,
+            while True:
+                # TODO: allow passing other settings
+                await self.send_async_command(
+                    hci.HCI_Create_Connection_Command(
+                        bd_addr=peer_address,
+                        packet_type=0xCC18,  # FIXME: change
+                        page_scan_repetition_mode=hci.HCI_R2_PAGE_SCAN_REPETITION_MODE,
+                        clock_offset=0x0000,
+                        allow_role_switch=0x01,
+                        reserved=0,
+                    )
                 )
-            )
 
-            # Wait for the connection process to complete
-            if timeout is None:
-                return await utils.cancel_on_event(
-                    self, Device.EVENT_FLUSH, pending_connection
-                )
+                if timeout is not None:
+                    break
+
+                try:
+                    return await utils.cancel_on_event(
+                        self, Device.EVENT_FLUSH, pending_connection
+                    )
+                except core.ConnectionError as error:
+                    if error.error_code != hci.HCI_ErrorCode.PAGE_TIMEOUT_ERROR:
+                        raise
+                    logger.debug(
+                        'Page timed out, retrying connection to %s', peer_address
+                    )
+                    pending_connection = asyncio.get_running_loop().create_future()
 
             try:
                 return await asyncio.wait_for(
@@ -4155,6 +4183,8 @@ class Device(utils.CompositeEventEmitter):
             self.remove_listener(self.EVENT_CONNECTION, on_connection)
             self.remove_listener(self.EVENT_CONNECTION_FAILURE, on_connection_failure)
             self.pending_connections.pop(peer_address, None)
+            if set_page_timeout:
+                await self._set_classic_page_timeout(self.classic_page_timeout)
 
     async def connect(
         self,
